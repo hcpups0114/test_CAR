@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>圈速計</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;background:#0b0b0c;color:#eee;font-family:-apple-system,system-ui,sans-serif;
+       -webkit-user-select:none;user-select:none}
+  #stage{position:relative;width:100%;background:#000;overflow:hidden}
+  video{width:100%;display:block}
+  #ovl{position:absolute;inset:0;width:100%;height:100%}
+  .panel{padding:12px}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+  button{background:#26262b;color:#eee;border:1px solid #3a3a42;border-radius:8px;
+         padding:9px 14px;font-size:15px}
+  button.on{background:#2563eb;border-color:#2563eb}
+  button:disabled{opacity:.4}
+  input[type=range]{flex:1;min-width:120px}
+  label{font-size:12px;color:#999;min-width:74px}
+  table{width:100%;border-collapse:collapse;font-size:16px;margin-top:6px}
+  th,td{padding:8px 4px;border-bottom:1px solid #26262b;text-align:right}
+  th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
+  th{font-size:12px;color:#888;font-weight:500}
+  .best{color:#4ade80}
+  .thumb{width:34px;height:34px;object-fit:cover;border-radius:5px;background:#26262b;
+         vertical-align:middle;display:inline-block}
+  #status{font-size:13px;color:#aaa;padding:8px 12px;background:#161619;border-radius:8px;
+          margin:0 12px}
+  h3{font-size:14px;color:#888;font-weight:600;margin:18px 0 6px;
+     text-transform:uppercase;letter-spacing:.05em}
+  details{margin-top:16px}
+  summary{font-size:14px;color:#888;padding:6px 0}
+  .hint{font-size:12px;color:#777;line-height:1.5;margin:4px 0 10px}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="v" playsinline muted autoplay></video>
+  <canvas id="ovl"></canvas>
+</div>
+
+<div id="status">按「開啟相機」開始</div>
+
+<div class="panel">
+  <div class="row">
+    <button id="btnCam">開啟相機</button>
+    <button id="btnBg" disabled>重學背景</button>
+    <button id="btnWhite" disabled>白卡校正</button>
+  </div>
+
+  <div class="row">
+    <label>偵測線</label>
+    <input type="range" id="roi" min="5" max="95" value="50">
+  </div>
+  <div class="row">
+    <label>白卡位置</label>
+    <input type="range" id="refx" min="2" max="98" value="8">
+  </div>
+
+  <h3>登錄車輛</h3>
+  <div class="hint">把車放在偵測帶內慢慢推過去，同時按對應按鈕。</div>
+  <div class="row" id="enroll"></div>
+
+  <h3>成績</h3>
+  <table>
+    <thead><tr><th>車</th><th></th><th>圈</th><th>本圈</th><th>最快</th></tr></thead>
+    <tbody id="tbl"></tbody>
+  </table>
+  <div class="row" style="margin-top:12px">
+    <button id="btnReset">成績歸零</button>
+  </div>
+
+  <details>
+    <summary>進階參數</summary>
+    <div class="row"><label>前景門檻</label>
+      <input type="range" id="pFg" min="30" max="200" value="95"><span id="vFg">95</span></div>
+    <div class="row"><label>佔用門檻</label>
+      <input type="range" id="pOcc" min="3" max="40" value="12"><span id="vOcc">12%</span></div>
+    <div class="row"><label>相似度門檻</label>
+      <input type="range" id="pMat" min="20" max="80" value="42"><span id="vMat">0.42</span></div>
+    <div class="row"><label>最短圈速</label>
+      <input type="range" id="pLap" min="5" max="60" value="20"><span id="vLap">2.0s</span></div>
+    <div class="hint" id="diag"></div>
+  </details>
+</div>
+
+<script>
+'use strict';
+
+/* ============ 顏色指紋 ============
+   16 色相格 x 2 飽和度格 = 32, 外加 4 個無彩色明度格 = 36 格。
+   無彩色那 4 格讓白車 / 灰車 / 黑車也分得開。 */
+const HUE = 16, SAT = 2, ACHRO = 4, NBIN = HUE * SAT + ACHRO;
+
+function sigNew() { return new Float32Array(NBIN); }
+
+function sigAdd(sig, r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  const s = mx > 0.004 ? d / mx : 0;
+  if (s < 0.22) {
+    sig[HUE * SAT + Math.min(ACHRO - 1, (mx * ACHRO) | 0)]++;
+    return;
+  }
+  let h;
+  if (mx === r) h = (g - b) / d;
+  else if (mx === g) h = 2 + (b - r) / d;
+  else h = 4 + (r - g) / d;
+  h /= 6; if (h < 0) h += 1;
+  const hi = Math.min(HUE - 1, (h * HUE) | 0);
+  const si = Math.min(SAT - 1, ((s - 0.22) / 0.78 * SAT) | 0);
+  sig[si * HUE + hi]++;
+}
+
+function sigNorm(sig) {
+  let t = 0; for (let i = 0; i < NBIN; i++) t += sig[i];
+  if (t > 0) for (let i = 0; i < NBIN; i++) sig[i] /= t;
+  return t;
+}
+
+function sigSim(a, b) {
+  let s = 0; for (let i = 0; i < NBIN; i++) s += Math.min(a[i], b[i]);
+  return s;
+}
+
+/* ============ 全域狀態 ============ */
+const W = 32, H = 120;            // ROI 取樣網格
+const roiCv = document.createElement('canvas'); roiCv.width = W; roiCv.height = H;
+const roiCtx = roiCv.getContext('2d', { willReadFrequently: true });
+const refCv = document.createElement('canvas'); refCv.width = 4; refCv.height = 4;
+const refCtx = refCv.getContext('2d', { willReadFrequently: true });
+
+const video = document.getElementById('v');
+const ovl = document.getElementById('ovl');
+const octx = ovl.getContext('2d');
+
+let bg = null, bgFrames = 0, learningBg = true;
+let roiX = 0.5, roiW = 0.06, refX = 0.08;
+let whiteCal = false, gain = [1, 1, 1];
+
+let inPass = false, entryT = 0, passSig = sigNew(), clearN = 0;
+let peakFg = 0, peakURL = null;
+
+let P = { fg: 95, occ: 0.12, match: 0.42, margin: 0.07, minLap: 2.0 };
+const CLEAR_NEEDED = 2, MAX_PASS = 1.5;
+
+const cars = [1, 2, 3, 4].map(i => ({
+  id: i, name: '#' + i, sig: null, thumb: null,
+  laps: 0, last: 0, best: 0, lastT: 0
+}));
+let pendingEnroll = null;
+let fps = 0, fpsT = 0, fpsN = 0, lastOcc = 0;
+
+const S = document.getElementById('status');
+const say = m => S.textContent = m;
+
+/* ============ 相機 ============ */
+document.getElementById('btnCam').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1280 }, height: { ideal: 720 },
+        frameRate: { ideal: 60 }
+      }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    document.getElementById('btnBg').disabled = false;
+    document.getElementById('btnWhite').disabled = false;
+    resetBg();
+    say('背景學習中，畫面請淨空');
+    video.requestVideoFrameCallback(onFrame);
+  } catch (e) {
+    say('相機開啟失敗：' + e.message + '（頁面必須用 https 開啟）');
+  }
+};
+
+function resetBg() { bg = null; bgFrames = 0; learningBg = true; inPass = false; }
+
+document.getElementById('btnBg').onclick = () => {
+  resetBg(); say('背景重新學習中，畫面請淨空');
+};
+
+document.getElementById('btnWhite').onclick = e => {
+  whiteCal = !whiteCal;
+  e.target.classList.toggle('on', whiteCal);
+  resetBg();
+  say(whiteCal ? '白卡校正開啟 — 白紙要一直在標記框內' : '白卡校正關閉');
+};
+
+/* ============ 逐幀處理 ============ */
+function onFrame(now, meta) {
+  const t = meta.mediaTime;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) { video.requestVideoFrameCallback(onFrame); return; }
+
+  fpsN++;
+  if (now - fpsT > 1000) { fps = fpsN * 1000 / (now - fpsT); fpsN = 0; fpsT = now; }
+
+  /* --- 白卡校正：量白紙，反推色偏 --- */
+  if (whiteCal) {
+    const rw = Math.max(8, vw * 0.04);
+    refCtx.drawImage(video, refX * vw - rw / 2, vh * 0.45, rw, vh * 0.1, 0, 0, 4, 4);
+    const rd = refCtx.getImageData(0, 0, 4, 4).data;
+    let sr = 0, sg = 0, sb = 0;
+    for (let i = 0; i < 16; i++) { sr += rd[i*4]; sg += rd[i*4+1]; sb += rd[i*4+2]; }
+    sr /= 16; sg /= 16; sb /= 16;
+    const cl = x => Math.max(0.5, Math.min(2.0, 160 / Math.max(20, x)));
+    gain = [cl(sr), cl(sg), cl(sb)];
+  } else gain = [1, 1, 1];
+
+  /* --- 取偵測帶 --- */
+  const sx = (roiX - roiW / 2) * vw, sw = roiW * vw;
+  roiCtx.drawImage(video, sx, 0, sw, vh, 0, 0, W, H);
+  const px = roiCtx.getImageData(0, 0, W, H).data;
+  const n = W * H;
+
+  if (!bg) bg = new Float32Array(n * 3);
+
+  /* 套用白卡增益 */
+  const buf = new Float32Array(n * 3);
+  for (let k = 0; k < n; k++) {
+    buf[k*3]   = Math.min(255, px[k*4]   * gain[0]);
+    buf[k*3+1] = Math.min(255, px[k*4+1] * gain[1]);
+    buf[k*3+2] = Math.min(255, px[k*4+2] * gain[2]);
+  }
+
+  /* --- 背景學習 --- */
+  if (learningBg) {
+    const a = bgFrames === 0 ? 1 : 0.15;
+    for (let k = 0; k < n * 3; k++) bg[k] = bg[k] * (1 - a) + buf[k] * a;
+    if (++bgFrames >= 25) { learningBg = false; say('就緒 — 可以登錄車輛了'); }
+    draw(0);
+    video.requestVideoFrameCallback(onFrame);
+    return;
+  }
+
+  /* --- 前景抽取 --- */
+  let fgN = 0;
+  const fsig = sigNew();
+  for (let k = 0; k < n; k++) {
+    const dr = Math.abs(buf[k*3]   - bg[k*3]);
+    const dg = Math.abs(buf[k*3+1] - bg[k*3+1]);
+    const db = Math.abs(buf[k*3+2] - bg[k*3+2]);
+    if (dr + dg + db > P.fg) {
+      fgN++;
+      sigAdd(fsig, buf[k*3], buf[k*3+1], buf[k*3+2]);
+    }
+  }
+  const occ = fgN / n;
+  lastOcc = occ;
+  const present = occ > P.occ;
+
+  /* --- 狀態機 --- */
+  if (!inPass) {
+    if (present) {
+      inPass = true; entryT = t; passSig = sigNew();
+      clearN = 0; peakFg = 0; peakURL = null;
+    } else {
+      for (let k = 0; k < n * 3; k++) bg[k] = bg[k] * 0.995 + buf[k] * 0.005;
+    }
+  }
+
+  if (inPass) {
+    if (present) {
+      clearN = 0;
+      for (let i = 0; i < NBIN; i++) passSig[i] += fsig[i];
+      if (fgN > peakFg) { peakFg = fgN; peakURL = roiCv.toDataURL('image/jpeg', 0.6); }
+    } else clearN++;
+
+    const tooLong = (t - entryT) > MAX_PASS;
+    if (clearN >= CLEAR_NEEDED || tooLong) {
+      inPass = false;
+      if (!tooLong) finalize(entryT);
+    }
+  }
+
+  draw(occ);
+  document.getElementById('diag').textContent =
+    `${fps.toFixed(0)} fps　佔用 ${(occ*100).toFixed(0)}%　` +
+    `增益 ${gain.map(g=>g.toFixed(2)).join('/')}`;
+  video.requestVideoFrameCallback(onFrame);
+}
+
+/* ============ 收尾比對 ============ */
+function finalize(t) {
+  const total = sigNorm(passSig);
+  if (total < 20) return;
+
+  if (pendingEnroll !== null) {
+    const c = cars.find(c => c.id === pendingEnroll);
+    c.sig = Float32Array.from(passSig);
+    c.thumb = peakURL;
+    pendingEnroll = null;
+    say(c.name + ' 登錄完成');
+    render();
+    return;
+  }
+
+  let best = null, bestS = 0, second = 0;
+  for (const c of cars) {
+    if (!c.sig) continue;
+    const s = sigSim(passSig, c.sig);
+    if (s > bestS) { second = bestS; bestS = s; best = c; }
+    else if (s > second) second = s;
+  }
+
+  if (!best || bestS < P.match || (bestS - second) < P.margin) {
+    say(`有東西通過，但認不出（最高相似度 ${bestS.toFixed(2)}）`);
+    return;
+  }
+
+  if (best.lastT > 0) {
+    const d = t - best.lastT;
+    if (d < P.minLap) return;
+    best.last = d;
+    if (!best.best || d < best.best) best.best = d;
+    best.laps++;
+  }
+  best.lastT = t;
+  say(`${best.name} 通過　${best.last ? best.last.toFixed(3) + 's' : ''}`);
+  render();
+}
+
+/* ============ 疊圖 ============ */
+function draw(occ) {
+  const r = video.getBoundingClientRect();
+  if (ovl.width !== r.width || ovl.height !== r.height) {
+    ovl.width = r.width; ovl.height = r.height;
+  }
+  octx.clearRect(0, 0, ovl.width, ovl.height);
+
+  const x = roiX * ovl.width, w = roiW * ovl.width;
+  octx.fillStyle = occ > P.occ ? 'rgba(239,68,68,.35)' : 'rgba(74,222,128,.18)';
+  octx.fillRect(x - w / 2, 0, w, ovl.height);
+
+  if (whiteCal) {
+    const rw = Math.max(10, ovl.width * 0.04);
+    octx.strokeStyle = '#fff'; octx.lineWidth = 2;
+    octx.strokeRect(refX * ovl.width - rw / 2, ovl.height * 0.45, rw, ovl.height * 0.1);
+  }
+}
+
+/* ============ UI ============ */
+function render() {
+  document.getElementById('enroll').innerHTML = cars.map(c =>
+    `<button onclick="enroll(${c.id})">${c.sig ? '重登 ' : '登錄 '}${c.name}</button>`
+  ).join('');
+
+  document.getElementById('tbl').innerHTML = cars.map(c => `
+    <tr>
+      <td>${c.name}</td>
+      <td>${c.thumb ? `<img class="thumb" src="${c.thumb}">`
+                    : '<span class="thumb"></span>'}</td>
+      <td>${c.laps}</td>
+      <td>${c.last ? c.last.toFixed(3) : '--'}</td>
+      <td class="best">${c.best ? c.best.toFixed(3) : '--'}</td>
+    </tr>`).join('');
+}
+
+window.enroll = id => {
+  pendingEnroll = id;
+  say(`請讓 #${id} 通過偵測帶`);
+};
+
+document.getElementById('btnReset').onclick = () => {
+  cars.forEach(c => { c.laps = 0; c.last = 0; c.best = 0; c.lastT = 0; });
+  render(); say('成績已歸零');
+};
+
+document.getElementById('roi').oninput = e => { roiX = e.target.value / 100; resetBg(); };
+document.getElementById('refx').oninput = e => { refX = e.target.value / 100; };
+
+const bind = (id, vid, fn, fmt) => {
+  const el = document.getElementById(id), lb = document.getElementById(vid);
+  el.oninput = () => { fn(+el.value); lb.textContent = fmt(+el.value); };
+  lb.textContent = fmt(+el.value);
+};
+bind('pFg',  'vFg',  v => P.fg = v,          v => v);
+bind('pOcc', 'vOcc', v => P.occ = v / 100,   v => v + '%');
+bind('pMat', 'vMat', v => P.match = v / 100, v => (v / 100).toFixed(2));
+bind('pLap', 'vLap', v => P.minLap = v / 10, v => (v / 10).toFixed(1) + 's');
+
+render();
+</script>
+</body>
+</html>
