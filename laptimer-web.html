@@ -17,7 +17,9 @@
   button{background:#26262b;color:#eee;border:1px solid #3a3a42;border-radius:8px;
          padding:9px 14px;font-size:15px}
   button.on{background:#2563eb;border-color:#2563eb}
+  button.run{background:#dc2626;border-color:#dc2626}
   button:disabled{opacity:.4}
+  #btnStart{font-size:17px;font-weight:600;padding:13px 22px;flex:1}
   input[type=range]{flex:1;min-width:120px}
   label{font-size:12px;color:#999;min-width:74px}
   table{width:100%;border-collapse:collapse;font-size:16px;margin-top:6px}
@@ -25,10 +27,11 @@
   th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
   th{font-size:12px;color:#888;font-weight:500}
   .best{color:#4ade80}
+  .wait{color:#facc15;font-size:13px}
   .thumb{width:34px;height:34px;object-fit:cover;border-radius:5px;background:#26262b;
          vertical-align:middle;display:inline-block}
-  #status{font-size:13px;color:#aaa;padding:8px 12px;background:#161619;border-radius:8px;
-          margin:0 12px}
+  #status{font-size:14px;color:#ddd;padding:10px 12px;background:#161619;border-radius:8px;
+          margin:0 12px;line-height:1.45}
   h3{font-size:14px;color:#888;font-weight:600;margin:18px 0 6px;
      text-transform:uppercase;letter-spacing:.05em}
   details{margin-top:16px}
@@ -53,6 +56,10 @@
   </div>
 
   <div class="row">
+    <button id="btnStart" disabled>開始計時</button>
+  </div>
+
+  <div class="row">
     <label>偵測線</label>
     <input type="range" id="roi" min="5" max="95" value="50">
   </div>
@@ -62,7 +69,7 @@
   </div>
 
   <h3>登錄車輛</h3>
-  <div class="hint">把車放在偵測帶內慢慢推過去，同時按對應按鈕。</div>
+  <div class="hint">按下按鈕後，把車放進偵測帶內慢慢推過去一次。四台都登錄完再開始計時。</div>
   <div class="row" id="enroll"></div>
 
   <h3>成績</h3>
@@ -141,6 +148,7 @@ const octx = ovl.getContext('2d');
 let bg = null, bgFrames = 0, learningBg = true;
 let roiX = 0.5, roiW = 0.06, refX = 0.08;
 let whiteCal = false, gain = [1, 1, 1];
+let running = false;              // <<< 計時中與否
 
 let inPass = false, entryT = 0, passSig = sigNew(), clearN = 0;
 let peakFg = 0, peakURL = null;
@@ -153,10 +161,10 @@ const cars = [1, 2, 3, 4].map(i => ({
   laps: 0, last: 0, best: 0, lastT: 0
 }));
 let pendingEnroll = null;
-let fps = 0, fpsT = 0, fpsN = 0, lastOcc = 0;
+let fps = 0, fpsT = 0, fpsN = 0;
 
 const S = document.getElementById('status');
-const say = m => S.textContent = m;
+const say = m => S.innerHTML = m;
 
 /* ============ 相機 ============ */
 document.getElementById('btnCam').onclick = async () => {
@@ -193,6 +201,26 @@ document.getElementById('btnWhite').onclick = e => {
   say(whiteCal ? '白卡校正開啟 — 白紙要一直在標記框內' : '白卡校正關閉');
 };
 
+/* ============ 開始 / 停止計時 ============ */
+document.getElementById('btnStart').onclick = e => {
+  running = !running;
+  if (running) {
+    cars.forEach(c => { c.lastT = 0; });   // 每台車重新等待起跑
+    say('<b>計時中</b><br>第一次通過只記起點，第二次通過才會出現第一圈成績。');
+  } else {
+    say('計時已停止');
+  }
+  e.target.textContent = running ? '停止計時' : '開始計時';
+  e.target.classList.toggle('run', running);
+  render();
+};
+
+function refreshStartButton() {
+  const anyEnrolled = cars.some(c => c.sig);
+  const b = document.getElementById('btnStart');
+  b.disabled = !anyEnrolled;
+}
+
 /* ============ 逐幀處理 ============ */
 function onFrame(now, meta) {
   const t = meta.mediaTime;
@@ -222,7 +250,6 @@ function onFrame(now, meta) {
 
   if (!bg) bg = new Float32Array(n * 3);
 
-  /* 套用白卡增益 */
   const buf = new Float32Array(n * 3);
   for (let k = 0; k < n; k++) {
     buf[k*3]   = Math.min(255, px[k*4]   * gain[0]);
@@ -234,7 +261,7 @@ function onFrame(now, meta) {
   if (learningBg) {
     const a = bgFrames === 0 ? 1 : 0.15;
     for (let k = 0; k < n * 3; k++) bg[k] = bg[k] * (1 - a) + buf[k] * a;
-    if (++bgFrames >= 25) { learningBg = false; say('就緒 — 可以登錄車輛了'); }
+    if (++bgFrames >= 25) { learningBg = false; say('就緒 — 請先逐台登錄車輛'); }
     draw(0);
     video.requestVideoFrameCallback(onFrame);
     return;
@@ -253,7 +280,6 @@ function onFrame(now, meta) {
     }
   }
   const occ = fgN / n;
-  lastOcc = occ;
   const present = occ > P.occ;
 
   /* --- 狀態機 --- */
@@ -292,16 +318,19 @@ function finalize(t) {
   const total = sigNorm(passSig);
   if (total < 20) return;
 
+  /* 登錄模式 */
   if (pendingEnroll !== null) {
     const c = cars.find(c => c.id === pendingEnroll);
     c.sig = Float32Array.from(passSig);
     c.thumb = peakURL;
     pendingEnroll = null;
     say(c.name + ' 登錄完成');
+    refreshStartButton();
     render();
     return;
   }
 
+  /* 比對 */
   let best = null, bestS = 0, second = 0;
   for (const c of cars) {
     if (!c.sig) continue;
@@ -315,15 +344,26 @@ function finalize(t) {
     return;
   }
 
-  if (best.lastT > 0) {
-    const d = t - best.lastT;
-    if (d < P.minLap) return;
-    best.last = d;
-    if (!best.best || d < best.best) best.best = d;
-    best.laps++;
+  /* 沒按開始就只顯示、不計圈 */
+  if (!running) {
+    say(`偵測到 ${best.name} 通過 — <b>尚未開始計時</b>，按「開始計時」才會記錄`);
+    return;
   }
+
+  if (best.lastT === 0) {
+    best.lastT = t;
+    say(`${best.name} 起跑 — 下次通過就會有第一圈成績`);
+    render();
+    return;
+  }
+
+  const d = t - best.lastT;
+  if (d < P.minLap) return;        // 同一次通過的重複觸發
+  best.last = d;
+  if (!best.best || d < best.best) best.best = d;
+  best.laps++;
   best.lastT = t;
-  say(`${best.name} 通過　${best.last ? best.last.toFixed(3) + 's' : ''}`);
+  say(`<b>${best.name}　${d.toFixed(3)}s</b>　第 ${best.laps} 圈`);
   render();
 }
 
@@ -336,7 +376,8 @@ function draw(occ) {
   octx.clearRect(0, 0, ovl.width, ovl.height);
 
   const x = roiX * ovl.width, w = roiW * ovl.width;
-  octx.fillStyle = occ > P.occ ? 'rgba(239,68,68,.35)' : 'rgba(74,222,128,.18)';
+  octx.fillStyle = occ > P.occ ? 'rgba(239,68,68,.35)'
+                 : (running ? 'rgba(74,222,128,.22)' : 'rgba(160,160,160,.18)');
   octx.fillRect(x - w / 2, 0, w, ovl.height);
 
   if (whiteCal) {
@@ -352,15 +393,20 @@ function render() {
     `<button onclick="enroll(${c.id})">${c.sig ? '重登 ' : '登錄 '}${c.name}</button>`
   ).join('');
 
-  document.getElementById('tbl').innerHTML = cars.map(c => `
-    <tr>
+  document.getElementById('tbl').innerHTML = cars.map(c => {
+    let lapCell;
+    if (!c.sig)                       lapCell = '<span class="wait">未登錄</span>';
+    else if (running && c.lastT === 0) lapCell = '<span class="wait">待起跑</span>';
+    else                              lapCell = c.laps;
+    return `<tr>
       <td>${c.name}</td>
       <td>${c.thumb ? `<img class="thumb" src="${c.thumb}">`
                     : '<span class="thumb"></span>'}</td>
-      <td>${c.laps}</td>
+      <td>${lapCell}</td>
       <td>${c.last ? c.last.toFixed(3) : '--'}</td>
       <td class="best">${c.best ? c.best.toFixed(3) : '--'}</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 }
 
 window.enroll = id => {
@@ -370,7 +416,7 @@ window.enroll = id => {
 
 document.getElementById('btnReset').onclick = () => {
   cars.forEach(c => { c.laps = 0; c.last = 0; c.best = 0; c.lastT = 0; });
-  render(); say('成績已歸零');
+  render(); say('成績已歸零' + (running ? ' — 仍在計時中，全部重新等待起跑' : ''));
 };
 
 document.getElementById('roi').oninput = e => { roiX = e.target.value / 100; resetBg(); };
@@ -387,6 +433,7 @@ bind('pMat', 'vMat', v => P.match = v / 100, v => (v / 100).toFixed(2));
 bind('pLap', 'vLap', v => P.minLap = v / 10, v => (v / 10).toFixed(1) + 's');
 
 render();
+refreshStartButton();
 </script>
 </body>
 </html>
